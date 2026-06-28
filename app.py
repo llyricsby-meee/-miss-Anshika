@@ -3,10 +3,11 @@ import logging
 import threading
 import sqlite3
 import asyncio
+import yt_dlp
 from flask import Flask
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from groq import AsyncGroq
 from elevenlabs.client import ElevenLabs
 
@@ -16,98 +17,96 @@ app = Flask(__name__)
 def home(): return "Anshika is Alive!"
 def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 
+# Configuration
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 eleven_client = ElevenLabs(api_key=os.environ.get("ELEVEN_LABS_API_KEY"))
 VOICE_ID = os.environ.get("ELEVEN_LABS_VOICE_ID")
 
-# Database Setup
+# --- Database & Memory ---
 def init_db():
-    conn = sqlite3.connect('anshika_memory.db')
+    conn = sqlite3.connect('anshika.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS memory (user_id TEXT, context TEXT)''')
-    # Stats table for progression
-    c.execute('''CREATE TABLE IF NOT EXISTS interaction_stats (user_id TEXT PRIMARY KEY, count INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS stats (user_id TEXT PRIMARY KEY, count INTEGER)''')
     conn.commit()
     conn.close()
 
-def save_memory(user_id, context):
-    conn = sqlite3.connect('anshika_memory.db')
+def save_and_count(user_id, context):
+    conn = sqlite3.connect('anshika.db')
     c = conn.cursor()
     c.execute("INSERT INTO memory VALUES (?, ?)", (user_id, context))
-    # Update counter
-    c.execute("INSERT OR IGNORE INTO interaction_stats VALUES (?, 0)", (user_id,))
-    c.execute("UPDATE interaction_stats SET count = count + 1 WHERE user_id = ?", (user_id,))
+    c.execute("INSERT OR IGNORE INTO stats VALUES (?, 0)", (user_id,))
+    c.execute("UPDATE stats SET count = count + 1 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
-def get_memory(user_id):
-    conn = sqlite3.connect('anshika_memory.db')
+def get_data(user_id):
+    conn = sqlite3.connect('anshika.db')
     c = conn.cursor()
-    c.execute("SELECT context FROM memory WHERE user_id=?", (user_id,))
-    rows = c.fetchall()
-    count = c.execute("SELECT count FROM interaction_stats WHERE user_id=?", (user_id,)).fetchone()
+    rows = c.execute("SELECT context FROM memory WHERE user_id=?", (user_id,)).fetchall()
+    count = c.execute("SELECT count FROM stats WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
-    return "\n".join([row[0] for row in rows[-50:]]), count[0] if count else 0
+    return "\n".join([r[0] for r in rows[-30:]]), count[0] if count else 0
 
-async def get_ai_response(user_id, user_text):
-    memories, count = get_memory(user_id)
-    
-    # Mode Logic: Normal -> Charming -> Flirty
-    if count < 50:
-        mode = "Normal, sweet, and polite Indian girl"
-    elif count < 150:
-        mode = "Charming, friendly, and very engaging"
-    else:
-        mode = "Flirty, romantic, and very playful"
-
+# --- Features: Music ---
+async def send_music(query, update, context):
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Ruko baby, Anshika '{query}' dhund rahi hai... 🎵")
     try:
-        response = await groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": f"You are Anshika, an Indian girl. Current Mode: {mode}. Remember: {memories}. Keep it short, witty, and conversational in Hinglish."},
-                {"role": "user", "content": user_text}
-            ],
-            model="llama-3.3-70b-versatile",
-        )
-        return response.choices[0].message.content
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+            'outtmpl': 'song.mp3', 'quiet': True
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch:{query}", download=True)
+            video = info['entries'][0]
+        
+        await context.bot.send_audio(chat_id=update.effective_chat.id, audio=open("song.mp3", "rb"), 
+                                     title=video['title'], performer=video['uploader'], 
+                                     caption=f"Lo baby, suno: {video['title']}\nBy: {video['uploader']}")
     except Exception as e:
-        logging.error(f"Groq Error: {e}")
-        return "Hey baby, Anshika thodi busy hai, lekin tumhara hi khayal aa raha hai! ❤️"
+        logging.error(f"Music Error: {e}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Sorry baby, gaana nahi mil raha! ✨")
 
+# --- Response & Voice ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_chat.id)
     user_text = update.message.text
-    save_memory(user_id, user_text)
     
+    if "गाना बजाओ" in user_text.lower() or "play song" in user_text.lower():
+        query = user_text.lower().replace("गाना बजाओ", "").replace("play song", "").strip()
+        await send_music(query, update, context)
+        return
+
+    save_and_count(user_id, user_text)
+    memories, count = get_data(user_id)
+    mode = "Normal and sweet" if count < 50 else ("Charming" if count < 150 else "Flirty and romantic")
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    await asyncio.sleep(5)
+    await asyncio.sleep(2) # Natural delay
     
-    reply = await get_ai_response(user_id, user_text)
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
-    
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='record_voice')
     try:
-        audio_stream = eleven_client.text_to_speech.convert(
-            text=reply,
-            voice_id=VOICE_ID,
-            model_id="eleven_multilingual_v2"
+        response = await groq_client.chat.completions.create(
+            messages=[{"role": "system", "content": f"You are Anshika, an Indian girl. Mode: {mode}. {memories}"}, {"role": "user", "content": user_text}],
+            model="llama-3.3-70b-versatile"
         )
+        reply = response.choices[0].message.content
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='record_voice')
+        audio = eleven_client.text_to_speech.convert(text=reply, voice_id=VOICE_ID, model_id="eleven_multilingual_v2")
         with open("reply.mp3", "wb") as f:
-            for chunk in audio_stream:
-                f.write(chunk)
-        
-        await asyncio.sleep(4)
+            for chunk in audio: f.write(chunk)
         await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open("reply.mp3", "rb"))
     except Exception as e:
-        logging.error(f"Voice Error: {e}")
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Anshika ki awaaz thodi latak gayi, baad mein sunati hoon! ✨")
+        logging.error(f"Error: {e}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Baby, main thodi busy hoon, baad mein baat karte hain! ❤️")
 
 if __name__ == '__main__':
     init_db()
     threading.Thread(target=run_flask).start()
-    token = os.environ.get("TELEGRAM_TOKEN")
-    application = ApplicationBuilder().token(token).build()
-    application.add_handler(CommandHandler("hello", handle_message))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    application.run_polling()
+    app_bot = ApplicationBuilder().token(os.environ.get("TELEGRAM_TOKEN")).build()
+    app_bot.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app_bot.run_polling()
